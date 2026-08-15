@@ -1,0 +1,11 @@
+Package: cli-ebook-reader
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: gbfdhenr <gbfdhenr@example.com>
+Description: Terminal-based EPUB ebook reader
+ A command-line EPUB reader with a file browser interface built with ratatui
+ and tui-file-explorer. Supports navigation, chapter selection, and
+ keyboard-driven file exploration.
+Homepage: https://github.com/gbfdhenr/cli-ebook-reader
