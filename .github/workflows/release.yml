@@ -1,0 +1,191 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build Linux Binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Strip binary
+        run: strip target/release/cli-ebook-reader-rust
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-ebook-reader-linux
+          path: target/release/cli-ebook-reader-rust
+          retention-days: 7
+
+  build-deb:
+    name: Build .deb Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev debhelper dpkg-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare deb package structure
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BINARY=target/release/cli-ebook-reader-rust
+          DEB_ROOT=deb-pkg
+          
+          # Create directory structure
+          mkdir -p "$DEB_ROOT/DEBIAN"
+          mkdir -p "$DEB_ROOT/usr/bin"
+          mkdir -p "$DEB_ROOT/usr/share/applications"
+          mkdir -p "$DEB_ROOT/usr/share/doc/cli-ebook-reader"
+          
+          # Copy binary
+          cp "$BINARY" "$DEB_ROOT/usr/bin/cli-ebook-reader"
+          chmod 755 "$DEB_ROOT/usr/bin/cli-ebook-reader"
+          
+          # Create control file
+          cat > "$DEB_ROOT/DEBIAN/control" << EOF
+          Package: cli-ebook-reader
+          Version: $VERSION
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: gbfdhenr <gbfdhenr@example.com>
+          Depends: \${shlibs:Depends}, \${misc:Depends}
+          Description: Terminal-based EPUB ebook reader
+           A command-line EPUB reader with a file browser interface built with ratatui.
+           Supports navigation, chapter selection, keyboard-driven file exploration,
+           persistent memory-mapped cache, and mouse support.
+          Homepage: https://github.com/gbfdhenr/cli-ebook-reader
+          EOF
+          
+          # Create copyright file
+          cat > "$DEB_ROOT/usr/share/doc/cli-ebook-reader/copyright" << EOF
+          Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+          Upstream-Name: cli-ebook-reader
+          Source: https://github.com/gbfdhenr/cli-ebook-reader
+          
+          Files: *
+          Copyright: 2024-2026 Liang Xiangan (gbfdhenr)
+          License: GPL-3.0+
+           This program is free software: you can redistribute it and/or modify
+           it under the terms of the GNU General Public License as published by
+           the Free Software Foundation, either version 3 of the License, or
+           (at your option) any later version.
+           .
+           This program is distributed in the hope that it will be useful,
+           but WITHOUT ANY WARRANTY; without even the implied warranty of
+           MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+           GNU General Public License for more details.
+           .
+           You should have received a copy of the GNU General Public License
+           along with this program.  If not, see <https://www.gnu.org/licenses/>.
+          EOF
+          
+          # Create changelog
+          cat > "$DEB_ROOT/usr/share/doc/cli-ebook-reader/changelog" << EOF
+          cli-ebook-reader ($VERSION) stable; urgency=medium
+          
+            * Initial release
+          
+           -- gbfdhenr <gbfdhenr@example.com>  $(date -R)
+          EOF
+          gzip -9 "$DEB_ROOT/usr/share/doc/cli-ebook-reader/changelog"
+          
+          # Build .deb
+          dpkg-deb --build "$DEB_ROOT" "cli-ebook-reader_${VERSION}_amd64.deb"
+          
+          echo "DEB_PATH=cli-ebook-reader_${VERSION}_amd64.deb" >> $GITHUB_ENV
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-ebook-reader-deb
+          path: cli-ebook-reader_${{ env.VERSION }}_amd64.deb
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: [build-linux, build-deb]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-ebook-reader-linux
+          path: release/
+
+      - name: Download .deb package
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-ebook-reader-deb
+          path: release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            release/cli-ebook-reader-rust
+            release/*.deb
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
