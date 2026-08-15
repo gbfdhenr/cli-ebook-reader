@@ -162,7 +162,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cli-ebook-reader-deb
-          path: cli-ebook-reader_${{ env.VERSION }}_amd64.deb
+          path: cli-ebook-reader_*_amd64.deb
           retention-days: 7
 
   release:
