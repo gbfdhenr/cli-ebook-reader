@@ -101,6 +101,9 @@ jobs:
           cp "$BINARY" "$DEB_ROOT/usr/bin/cli-ebook-reader"
           chmod 755 "$DEB_ROOT/usr/bin/cli-ebook-reader"
           
+          # Calculate shared library dependencies
+          DEPENDS=$(dpkg-shlibdeps -O "$DEB_ROOT/usr/bin/cli-ebook-reader" 2>/dev/null | sed 's/^shlibs:Depends=//' || echo "libc6 (>= 2.17)")
+
           # Create control file
           cat > "$DEB_ROOT/DEBIAN/control" << EOF
           Package: cli-ebook-reader
@@ -109,7 +112,7 @@ jobs:
           Priority: optional
           Architecture: amd64
           Maintainer: gbfdhenr <gbfdhenr@example.com>
-          Depends: \${shlibs:Depends}, \${misc:Depends}
+          Depends: $DEPENDS
           Description: Terminal-based EPUB ebook reader
            A command-line EPUB reader with a file browser interface built with ratatui.
            Supports navigation, chapter selection, keyboard-driven file exploration,
