@@ -55,6 +55,11 @@ struct CachedChapter {
 }
 
 impl CacheManager {
+    /// 获取缓存元数据（只读）
+    pub fn get_meta(&self) -> Option<&BookCacheMeta> {
+        self.meta.as_ref()
+    }
+
     /// 创建缓存管理器
     pub fn new() -> Result<Self> {
         let cache_dir = dirs::cache_dir()
@@ -284,11 +289,14 @@ impl CacheManager {
             meta.last_read_chapter = chapter;
             meta.last_line_offset = line_offset;
 
-            let (meta_path, _) = self.cache_paths(&meta.book_id);
+            let book_id = meta.book_id.clone();
+            drop(meta); // 释放可变借用
+
+            let (meta_path, _) = self.cache_paths(&book_id);
             let tmp_path = meta_path.with_extension("meta.json.tmp");
 
             let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp_path)?;
-            let json = serde_json::to_string_pretty(meta)?;
+            let json = serde_json::to_string_pretty(&self.meta.as_ref().unwrap())?;
             file.write_all(json.as_bytes())?;
             file.flush()?;
             file.sync_all()?;

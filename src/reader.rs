@@ -240,7 +240,7 @@ impl ReaderState {
                             self.book_title = chapters[0].title.clone(); // 临时
                             // 从缓存获取书名
                             if let Ok(guard) = self.cache.lock() {
-                                if let Some(meta) = &guard.meta {
+                                if let Some(meta) = guard.get_meta() {
                                     self.book_title = meta.book_title.clone();
                                     self.current_chapter = meta.last_read_chapter.min(chapters.len().saturating_sub(1));
                                     self.line_offset = meta.last_line_offset;
