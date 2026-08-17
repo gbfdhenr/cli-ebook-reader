@@ -1,19 +1,7 @@
 [package]
 name = "cli-ebook-reader-rust"
-version = "1.0.10"
+version = "1.0.11"
 edition = "2024"
-
-[[bin]]
-name = "bench_load"
-path = "benches/bench_load.rs"
-
-[[bin]]
-name = "bench_full"
-path = "benches/bench_full.rs"
-
-[[bin]]
-name = "bench_reader"
-path = "benches/bench_reader.rs"
 
 [dependencies]
 crossterm = "0.29"
