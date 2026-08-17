@@ -392,7 +392,7 @@ impl ReaderState {
         let tag_re = Regex::new(r"(?i)<[^>]*>").unwrap();
         result = tag_re.replace_all(&result, " ").to_string();
 
-        // 处理 HTML 实体
+                // 处理 HTML 实体
         result = result.replace("&nbsp;", " ")
             .replace("<", "<")
             .replace(">", ">")
