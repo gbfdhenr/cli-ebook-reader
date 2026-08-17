@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span, Text};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
@@ -43,15 +44,19 @@ enum ExitConfirmState {
     ExitClicked,    // 点击了退出按钮，等待 y/其他键
 }
 
+/// 加载进度信息（从后台线程发送）
+#[derive(Debug, Clone)]
+struct LoadingProgress {
+    progress: f32,           // 0.0 - 1.0
+    current_chapter: usize,
+    total_chapters: usize,
+    stage: LoadingStage,
+}
+
 /// 读取器状态
 enum LoadingState {
     Idle,
-    Loading { 
-        progress: f32,           // 0.0 - 1.0
-        current_chapter: usize,
-        total_chapters: usize,
-        stage: LoadingStage,
-    },
+    Loading(LoadingProgress),
     Loaded,
     Failed(String),
 }
@@ -91,6 +96,8 @@ pub struct ReaderState {
     loading_state: LoadingState,
     /// 加载线程句柄
     load_handle: Option<thread::JoinHandle<Result<Vec<Chapter>>>>,
+    /// 进度接收器（从后台线程接收进度更新）
+    progress_rx: Option<mpsc::Receiver<LoadingProgress>>,
     /// 是否首次加载（用于显示文件名还是书名）
     first_load: bool,
 }
@@ -117,6 +124,7 @@ impl ReaderState {
             epub_path,
             loading_state: LoadingState::Idle,
             load_handle: None,
+            progress_rx: None,
             first_load,
         })
     }
@@ -127,31 +135,51 @@ impl ReaderState {
         let cache = self.cache.clone();
         let first_load = self.first_load;
 
-        self.loading_state = LoadingState::Loading {
-            progress: 0.0,
+        // 创建进度通道
+        let (progress_tx, progress_rx) = mpsc::channel();
+        self.progress_rx = Some(progress_rx);
+
+        // 初始加载状态 - 显示 1% 避免空进度条
+        self.loading_state = LoadingState::Loading(LoadingProgress {
+            progress: 0.01,
             current_chapter: 0,
             total_chapters: 0,
             stage: LoadingStage::ParsingSpine,
-        };
+        });
 
         let handle = thread::spawn(move || {
+            // 发送进度更新的辅助函数
+            let send_progress = |tx: &mpsc::Sender<LoadingProgress>, progress: f32, current: usize, total: usize, stage: LoadingStage| {
+                let _ = tx.send(LoadingProgress { progress, current_chapter: current, total_chapters: total, stage });
+            };
+
+            // 启动时清理临时文件
+            if let Ok(cache_guard) = cache.lock() {
+                let _ = cache_guard.cleanup_temp_files();
+            }
+
             // 尝试从缓存加载
             let mut cache_guard = cache.lock().unwrap();
             if let Ok(Some(meta)) = cache_guard.load_meta(&epub_path) {
-                // 有有效缓存，从 mmap 读取所有章节
+                // 有有效缓存，从 mmap 读取所有章节（按当前视口宽度换行）
+                let total = meta.chapters.len();
                 let mut chapters = Vec::new();
                 for (idx, cm) in meta.chapters.iter().enumerate() {
-                    if let Ok(Some(lines)) = cache_guard.read_chapter(idx) {
+                    // 使用 80 作为默认宽度，后续会在 UI 中重新换行
+                    if let Ok(Some(lines)) = cache_guard.read_chapter(idx, 80) {
                         chapters.push(Chapter { title: cm.title.clone(), lines });
                     }
+                    // 发送缓存加载进度
+                    send_progress(&progress_tx, (idx + 1) as f32 / total.max(1) as f32, idx + 1, total, LoadingStage::BuildingCache);
                 }
                 cache_guard.update_hot_cache(0, 80);
+                send_progress(&progress_tx, 1.0, total, total, LoadingStage::Done);
                 return Ok(chapters);
             }
             drop(cache_guard);
 
             // 无缓存，解析 EPUB 并构建缓存
-            Self::parse_and_cache(epub_path, cache, first_load)
+            Self::parse_and_cache(epub_path, cache, first_load, progress_tx)
         });
 
         self.load_handle = Some(handle);
@@ -161,27 +189,39 @@ impl ReaderState {
     fn parse_and_cache(
         epub_path: PathBuf,
         cache: Arc<Mutex<CacheManager>>,
-        first_load: bool,
+        _first_load: bool,
+        progress_tx: mpsc::Sender<LoadingProgress>,
     ) -> Result<Vec<Chapter>> {
+        let send_progress = |tx: &mpsc::Sender<LoadingProgress>, progress: f32, current: usize, total: usize, stage: LoadingStage| {
+            let _ = tx.send(LoadingProgress { progress, current_chapter: current, total_chapters: total, stage });
+        };
+
+        // 立即发送初始进度，避免大文件打开时长时间无反馈
+        send_progress(&progress_tx, 0.01, 0, 0, LoadingStage::ParsingSpine);
+
         let mut doc = EpubDoc::new(&epub_path).context("open epub")?;
         let book_title = doc.get_title().unwrap_or_else(|| "Unknown Book".to_string());
 
-        // 阶段 1：解析 spine
+        // EPUB 文档已打开，发送进度
+        send_progress(&progress_tx, 0.05, 0, 0, LoadingStage::ParsingSpine);
         let spine_items: Vec<_> = doc.spine.iter().cloned().collect();
         let mut chapter_infos = Vec::new();
 
         for spine_item in &spine_items {
-            let resource_id = &spine_item.idref;  // borrow as &str
+            let resource_id = &spine_item.idref;
             if let Some((_, mime)) = doc.get_resource_str(resource_id) {
                 if mime == "application/xhtml+xml" || mime == "text/html" {
                     let title = Self::find_chapter_title_static(&doc, resource_id)
                         .unwrap_or_else(|| format!("Chapter {}", chapter_infos.len() + 1));
-                    chapter_infos.push((resource_id.to_string(), title));
+                    // 检查是否为目录章节（通过标题或内容特征判断）
+                    let is_toc = Self::is_toc_chapter(&doc, resource_id, &title);
+                    chapter_infos.push((resource_id.to_string(), title, is_toc));
                 }
             }
         }
 
         let total_chapters = chapter_infos.len();
+        send_progress(&progress_tx, 0.15, 0, total_chapters, LoadingStage::ExtractingChapters);
 
         // 开始构建缓存
         let mut builder = {
@@ -192,30 +232,43 @@ impl ReaderState {
 
         // 阶段 2：提取章节内容并写入缓存
         let mut chapters = Vec::new();
-        for (idx, (resource_id, title)) in chapter_infos.iter().enumerate() {
-            // 更新进度（通过共享状态或回调，这里简化）
+        for (idx, (resource_id, title, is_toc)) in chapter_infos.iter().enumerate() {
+            let progress = 0.15 + 0.7 * (idx as f32 / total_chapters.max(1) as f32);
+            send_progress(&progress_tx, progress, idx + 1, total_chapters, LoadingStage::ExtractingChapters);
+
             if let Some((content, _)) = doc.get_resource_str(&resource_id) {
-                let plain_text = from_read(content.as_bytes(), 80);
+                // 预处理 HTML：移除图片标签和其他可能导致 html2text 卡顿的元素
+                let cleaned_html = Self::clean_html_for_text_extraction(&content);
+                let mut plain_text = from_read(cleaned_html.as_bytes(), 80);
+                
+                // 如果是目录章节，尝试解析其中的 markdown 链接
+                if *is_toc {
+                    plain_text = Self::process_toc_chapter(&plain_text, &doc, &chapter_infos);
+                }
+                
                 builder.add_chapter(idx, title.clone(), &plain_text)?;
-                chapters.push(Chapter { 
-                    title: title.clone(), 
-                    lines: plain_text.lines().map(|s| s.to_string()).collect() 
+                chapters.push(Chapter {
+                    title: title.clone(),
+                    lines: plain_text.lines().map(|s| s.to_string()).collect()
                 });
             }
         }
 
         // 阶段 3：完成缓存构建
+        send_progress(&progress_tx, 0.9, total_chapters, total_chapters, LoadingStage::BuildingCache);
         {
             let mut cache_guard = cache.lock().unwrap();
             cache_guard.finish_build(builder)?;
         }
 
         // 初始化热缓存
+        send_progress(&progress_tx, 0.95, total_chapters, total_chapters, LoadingStage::BuildingCache);
         {
-            let mut cache_guard = cache.lock().unwrap();
+            let cache_guard = cache.lock().unwrap();
             cache_guard.update_hot_cache(0, 80);
         }
 
+        send_progress(&progress_tx, 1.0, total_chapters, total_chapters, LoadingStage::Done);
         Ok(chapters)
     }
 
@@ -230,15 +283,116 @@ impl ReaderState {
         None
     }
 
-    /// 检查加载进度
+    /// 清理 HTML，移除图片、脚本、样式等可能导致 html2text 卡顿的元素
+    fn clean_html_for_text_extraction(html: &str) -> String {
+        use regex::Regex;
+        let mut result = html.to_string();
+
+        // 移除 <img> 标签（保留 alt 文本）
+        let img_re = Regex::new(r#"<img[^>]*alt\s*=\s*["']([^"']*)["'][^>]*>"#).unwrap();
+        result = img_re.replace_all(&result, |caps: &regex::Captures| {
+            let alt = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            format!("[图片: {}]", alt)
+        }).to_string();
+        
+        // 移除没有 alt 的 <img> 标签
+        let img_no_alt_re = Regex::new(r#"<img[^>]*>"#).unwrap();
+        result = img_no_alt_re.replace_all(&result, "[图片]").to_string();
+
+        // 移除 <script> 标签及其内容
+        let script_re = Regex::new(r"(?s)<script[^>]*>.*?</script>").unwrap();
+        result = script_re.replace_all(&result, "").to_string();
+
+        // 移除 <style> 标签及其内容
+        let style_re = Regex::new(r"(?s)<style[^>]*>.*?</style>").unwrap();
+        result = style_re.replace_all(&result, "").to_string();
+
+        // 移除 HTML 注释
+        let comment_re = Regex::new(r"(?s)<!--.*?-->").unwrap();
+        result = comment_re.replace_all(&result, "").to_string();
+
+        result
+    }
+
+    /// 判断是否为目录章节（TOC）
+    fn is_toc_chapter(doc: &EpubDoc<impl io::Read + io::Seek>, resource_id: &str, title: &str) -> bool {
+        // 1. 通过标题判断：包含 "目录"、"Table of Contents"、"Contents" 等关键词
+        let title_lower = title.to_lowercase();
+        if title_lower.contains("目录") 
+            || title_lower.contains("table of contents") 
+            || title_lower.contains("contents")
+            || title_lower.contains("toc") {
+            return true;
+        }
+
+        // 2. 通过内容判断：如果章节主要包含指向其他章节的链接
+        if let Some((content, _)) = doc.get_resource_str(resource_id) {
+            // 简单检查：内容中是否包含大量指向 spine 内部的链接
+            let link_count = content.matches("<a href=").count();
+            let text_len = content.len();
+            // 如果链接密度很高，可能是目录
+            if link_count > 5 && text_len < 5000 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 处理目录章节：解析 markdown 格式的链接，转换为可读格式
+    fn process_toc_chapter(text: &str, _doc: &EpubDoc<impl io::Read + io::Seek>, chapter_infos: &[(String, String, bool)]) -> String {
+        use regex::Regex;
+        let mut result = text.to_string();
+        
+        // 正则匹配 markdown 格式的链接：[链接文本](链接地址)
+        let md_link_re = Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
+        result = md_link_re.replace_all(&result, |caps: &regex::Captures| {
+            let link_text = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let link_url = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            
+            // 尝试匹配到对应的章节
+            for (_, chapter_title, _) in chapter_infos {
+                if chapter_title.contains(link_text) || link_text.contains(chapter_title) {
+                    return format!("► {} (第 {} 章)", link_text, chapter_title);
+                }
+            }
+            
+            // 如果没匹配到章节，保留原文本但标记为链接
+            format!("► {} → {}", link_text, link_url)
+        }).to_string();
+        
+        // 也处理 HTML 格式的链接
+        let html_link_re = Regex::new(r#"<a[^>]*href\s*=\s*["']([^"']*)["'][^>]*>([^<]*)</a>"#).unwrap();
+        result = html_link_re.replace_all(&result, |caps: &regex::Captures| {
+            let link_url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let link_text = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            
+            for (_, chapter_title, _) in chapter_infos {
+                if chapter_title.contains(link_text) || link_text.contains(chapter_title) {
+                    return format!("► {} (第 {} 章)", link_text, chapter_title);
+                }
+            }
+            format!("► {} → {}", link_text, link_url)
+        }).to_string();
+        
+        result
+    }
+
+    /// 检查加载进度（包括从后台线程接收进度更新）
     fn check_loading(&mut self) {
+        // 先处理进度通道的更新
+        if let Some(rx) = &self.progress_rx {
+            while let Ok(progress) = rx.try_recv() {
+                self.loading_state = LoadingState::Loading(progress);
+            }
+        }
+
+        // 再检查线程是否完成
         if let Some(handle) = self.load_handle.take() {
             if handle.is_finished() {
                 match handle.join() {
                     Ok(Ok(chapters)) => {
                         if !chapters.is_empty() {
-                            self.book_title = chapters[0].title.clone(); // 临时
-                            // 从缓存获取书名
+                            // 从缓存获取真实书名和阅读进度
                             if let Ok(guard) = self.cache.lock() {
                                 if let Some(meta) = guard.get_meta() {
                                     self.book_title = meta.book_title.clone();
@@ -246,16 +400,22 @@ impl ReaderState {
                                     self.line_offset = meta.last_line_offset;
                                 }
                             }
+                            // 如果缓存没有 meta（不应发生），回退到第一个章节标题
+                            if self.book_title == "Unknown Book" {
+                                self.book_title = chapters[0].title.clone();
+                            }
                         }
                         self.chapters = chapters;
                         self.loading_state = LoadingState::Loaded;
                         self.first_load = false;
+                        // 加载完成后钳制偏移
+                        self.clamp_offset();
                     }
                     Ok(Err(e)) => {
                         self.loading_state = LoadingState::Failed(e.to_string());
                     }
                     Err(_) => {
-                        self.loading_state = LoadingState::Failed("Thread panicked".to_string());
+                        self.loading_state = LoadingState::Failed("加载线程异常终止".to_string());
                     }
                 }
             } else {
@@ -303,7 +463,7 @@ impl ReaderState {
         if total_lines == 0 {
             return ((self.current_chapter as f32 / self.chapters.len() as f32) * 100.0) as u8;
         }
-        let line_progress = self.line_offset as f32 / total_lines.max(1) as f32;
+        let line_progress = self.line_offset as f32 / total_lines as f32;
         let total_progress = (self.current_chapter as f32 + line_progress) / self.chapters.len() as f32 * 100.0;
         total_progress.min(100.0) as u8
     }
@@ -399,7 +559,7 @@ impl ReaderState {
     /// 处理键盘事件，返回 true 表示应该退出程序
     fn handle_key_with_exit(&mut self, key: KeyEvent) -> Result<bool> {
         // 加载中忽略大部分按键，只允许退出
-        if matches!(self.loading_state, LoadingState::Loading { .. }) {
+        if matches!(self.loading_state, LoadingState::Loading(_)) {
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(true); // 强制退出
@@ -466,20 +626,27 @@ impl ReaderState {
             KeyCode::End => { self.line_offset = max_offset; }
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('n') => {
                 if self.current_chapter + 1 < self.chapters.len() {
-                    self.current_chapter += 1; 
+                    self.current_chapter += 1;
                     self.line_offset = 0;
-                    // 更新热缓存
+                    // 更新热缓存，并重新按当前宽度换行当前章
                     if let Ok(cache) = self.cache.lock() {
                         cache.update_hot_cache(self.current_chapter, self.viewport_width);
+                        // 从热缓存读取当前章（已按 viewport_width 换行）
+                        if let Some(cached) = cache.get_hot_chapter(self.current_chapter, self.viewport_width) {
+                            self.chapters[self.current_chapter].lines = cached.lines;
+                        }
                     }
                 }
             }
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('p') => {
                 if self.current_chapter > 0 {
-                    self.current_chapter -= 1; 
+                    self.current_chapter -= 1;
                     self.line_offset = 0;
                     if let Ok(cache) = self.cache.lock() {
                         cache.update_hot_cache(self.current_chapter, self.viewport_width);
+                        if let Some(cached) = cache.get_hot_chapter(self.current_chapter, self.viewport_width) {
+                            self.chapters[self.current_chapter].lines = cached.lines;
+                        }
                     }
                 }
             }
@@ -495,7 +662,7 @@ impl ReaderState {
 
     /// 处理鼠标事件，返回 true 表示应该退出程序
     fn handle_mouse_with_exit(&mut self, mouse: MouseEvent) -> Result<bool> {
-        if matches!(self.loading_state, LoadingState::Loading { .. } | LoadingState::Failed(_)) {
+        if matches!(self.loading_state, LoadingState::Loading(_) | LoadingState::Failed(_)) {
             return Ok(false);
         }
 
@@ -510,6 +677,9 @@ impl ReaderState {
                     self.current_chapter -= 1; self.line_offset = 0;
                     if let Ok(cache) = self.cache.lock() {
                         cache.update_hot_cache(self.current_chapter, self.viewport_width);
+                        if let Some(cached) = cache.get_hot_chapter(self.current_chapter, self.viewport_width) {
+                            self.chapters[self.current_chapter].lines = cached.lines;
+                        }
                     }
                 }
             }
@@ -518,6 +688,9 @@ impl ReaderState {
                     self.current_chapter += 1; self.line_offset = 0;
                     if let Ok(cache) = self.cache.lock() {
                         cache.update_hot_cache(self.current_chapter, self.viewport_width);
+                        if let Some(cached) = cache.get_hot_chapter(self.current_chapter, self.viewport_width) {
+                            self.chapters[self.current_chapter].lines = cached.lines;
+                        }
                     }
                 }
             }
@@ -549,9 +722,12 @@ impl ReaderState {
         let right_width = right_btn.width();
         let progress_width = progress_str.width();
 
+        // 布局顺序：[退出] [ < ] [菜单区] [ > ] [进度%]
         let exit_end = exit_width;
         let left_end = exit_end + left_width;
-        let right_start = width.saturating_sub(right_width + progress_width);
+        // 右按钮和进度在最右侧
+        let progress_start = width.saturating_sub(progress_width);
+        let right_start = progress_start.saturating_sub(right_width);
         let menu_start = left_end;
         let menu_end = right_start;
 
@@ -563,6 +739,8 @@ impl ReaderState {
             BottomBarAction::PrevChapter
         } else if x_pos >= right_start && x_pos < right_start + right_width {
             BottomBarAction::NextChapter
+        } else if x_pos >= progress_start && x_pos < width {
+            BottomBarAction::None // 进度条区域不响应点击
         } else if x_pos >= menu_start && x_pos < menu_end {
             BottomBarAction::Menu
         } else {
@@ -580,7 +758,7 @@ impl ReaderState {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         // 加载中状态
-        if matches!(self.loading_state, LoadingState::Loading { .. }) {
+        if matches!(self.loading_state, LoadingState::Loading(_)) {
             self.draw_loading(frame, area);
             return;
         }
@@ -622,12 +800,12 @@ impl ReaderState {
 
     /// 绘制加载进度界面
     fn draw_loading(&self, frame: &mut Frame, area: Rect) {
-        let (progress, current, total, stage) = match &self.loading_state {
-            LoadingState::Loading { progress, current_chapter, total_chapters, stage } => {
-                (*progress, *current_chapter, *total_chapters, *stage)
-            }
+        let progress_info = match &self.loading_state {
+            LoadingState::Loading(p) => p,
             _ => return,
         };
+
+        let LoadingProgress { progress, current_chapter, total_chapters, stage } = progress_info;
 
         // 显示名称：首次加载显示文件名，后续显示书名
         let display_name = if self.first_load {
@@ -646,9 +824,18 @@ impl ReaderState {
         };
 
         let percent = (progress * 100.0) as u32;
-        let bar_width = (area.width as usize).saturating_sub(20).min(60);
+        
+        // popup 宽度固定为 80，确保能容纳完整进度信息
+        let popup_width = 80u16.min(area.width);
+        let inner_width = popup_width.saturating_sub(4) as usize; // 减去边框和内边距
+        
+        // 进度条宽度基于 popup 内部宽度
+        let bar_width = inner_width.saturating_sub(30).min(40).max(10);
         let filled = ((bar_width as f32 * progress) as usize).min(bar_width);
         let empty = bar_width - filled;
+
+        // total_chapters 是 &usize（从引用解构），需要解引用
+        let total_ch = *total_chapters;
 
         let loading_text = format!(
             " 正在加载: {}  [{}{}] {}%  ({}/{})  {} ",
@@ -656,8 +843,8 @@ impl ReaderState {
             "█".repeat(filled),
             "░".repeat(empty),
             percent,
-            current + 1,
-            total.max(1),
+            current_chapter + 1,
+            total_ch.max(1),
             stage_text
         );
 
@@ -666,9 +853,8 @@ impl ReaderState {
             .alignment(ratatui::layout::Alignment::Center)
             .block(Block::default().borders(Borders::ALL).title(" 加载中 "));
 
-        // 居中显示
-        let popup_width = area.width.min(80);
-        let popup_height = 5;
+        // 居中显示，高度改为 3 行更紧凑
+        let popup_height = 3;
         let x = (area.width.saturating_sub(popup_width)) / 2;
         let y = (area.height.saturating_sub(popup_height)) / 2;
         let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -758,20 +944,24 @@ impl ReaderState {
         let right_width = right_btn.width();
 
         let available = area.width as usize;
+        // 菜单区宽度 = 总宽 - 退出 - 左按钮 - 右按钮 - 进度 - 间距
         let menu_width = available
             .saturating_sub(exit_width + left_width + right_width + progress_width + 2)
             .max(8);
 
         let mut parts = Vec::new();
 
+        // [退出] - 最左侧
         let exit_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
         parts.push(Span::styled(exit_btn, exit_style));
 
+        // [ < ] - 左按钮
         let left_style = if self.current_chapter > 0 {
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
         } else { Style::default().fg(Color::DarkGray) };
         parts.push(Span::styled(left_btn, left_style));
 
+        // 菜单区 - 中间填充
         let menu_text = if self.menu_open { " ☰ MENU " } else { " ☰ Menu " };
         let menu_style = if self.menu_open {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::REVERSED)
@@ -779,11 +969,13 @@ impl ReaderState {
         let padded_menu = format!("{:^width$}", menu_text, width = menu_width.max(menu_text.width()));
         parts.push(Span::styled(padded_menu, menu_style));
 
+        // [ > ] - 右按钮
         let right_style = if self.current_chapter + 1 < self.chapters.len() {
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
         } else { Style::default().fg(Color::DarkGray) };
         parts.push(Span::styled(right_btn, right_style));
 
+        // 进度% - 最右侧
         parts.push(Span::styled(progress_str, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
 
         let bottom_bar = Paragraph::new(Line::from(parts))
@@ -804,15 +996,16 @@ impl ReaderState {
             _ => return,
         };
 
-        let popup_width = msg.width() + 4;
+        let popup_width = (msg.width() + 4).min(area.width.saturating_sub(2) as usize) as u16;
         let popup_height = 3;
-        let x = (area.width.saturating_sub(popup_width as u16)) / 2;
+        let x = (area.width.saturating_sub(popup_width)) / 2;
         let y = (area.height.saturating_sub(popup_height)) / 2;
 
-        let popup_area = Rect::new(x, y, popup_width as u16, popup_height);
+        let popup_area = Rect::new(x, y, popup_width, popup_height);
 
-        let bg = Block::default().style(Style::default().bg(Color::Black).fg(Color::White));
-        frame.render_widget(bg, area);
+        // 半透明遮罩效果：仅在弹窗区域绘制深色背景
+        let overlay = Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0)));
+        frame.render_widget(overlay, popup_area);
 
         let block = Block::default()
             .borders(Borders::ALL)

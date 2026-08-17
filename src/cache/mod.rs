@@ -3,10 +3,11 @@ use memmap2::{MmapMut, MmapOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use unicode_width::UnicodeWidthChar;
 
 /// 章节元数据（不包含正文，仅索引信息）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,7 +16,7 @@ pub struct ChapterMeta {
     pub title: String,
     pub start_offset: u64,  // 在 mmap 文件中的字节偏移
     pub length: u32,        // 字节长度
-    pub line_count: u32,    // 行数（按当前宽度换行后）
+    pub line_count: u32,    // 行数（按标准宽度 80 换行后）
 }
 
 /// 书籍缓存元数据
@@ -37,7 +38,7 @@ pub struct CacheManager {
     /// 内存映射文件（全书内容，swap-backed）
     mmap_file: Option<File>,
     mmap: Option<MmapMut>,
-    /// 热章节缓存（±3 章），保存在内存 + 可选快速文件
+    /// 热章节缓存（±3 章），保存在内存
     hot_cache: Arc<Mutex<HotChapterCache>>,
     meta: Option<BookCacheMeta>,
 }
@@ -46,12 +47,13 @@ pub struct CacheManager {
 struct HotChapterCache {
     chapters: HashMap<usize, CachedChapter>,
     center_chapter: Option<usize>,
+    viewport_width: u16,
 }
 
 #[derive(Debug, Clone)]
-struct CachedChapter {
-    title: String,
-    lines: Vec<String>,  // 已按宽度换行的行
+pub(crate) struct CachedChapter {
+    pub title: String,
+    pub lines: Vec<String>,  // 已按宽度换行的行
 }
 
 impl CacheManager {
@@ -73,18 +75,24 @@ impl CacheManager {
             hot_cache: Arc::new(Mutex::new(HotChapterCache {
                 chapters: HashMap::new(),
                 center_chapter: None,
+                viewport_width: 80,
             })),
             meta: None,
         })
     }
 
-    /// 计算书籍 ID（基于文件路径 + 大小 + 修改时间）
+    /// 计算书籍 ID（基于文件路径 + 大小 + 修改时间秒级）
+    /// 使用秒级 mtime 避免复制文件导致缓存失效
     fn compute_book_id(path: &Path) -> Result<String> {
         let meta = fs::metadata(path)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(path.to_string_lossy().as_bytes());
         hasher.update(&meta.len().to_le_bytes());
-        hasher.update(&meta.modified()?.elapsed()?.as_nanos().to_le_bytes());
+        // 使用秒级修改时间，忽略纳秒差异
+        let mtime_secs = meta.modified()?
+            .duration_since(UNIX_EPOCH)?
+            .as_secs();
+        hasher.update(&mtime_secs.to_le_bytes());
         Ok(hasher.finalize().to_hex().to_string()[..16].to_string())
     }
 
@@ -227,8 +235,8 @@ impl CacheManager {
         Ok(meta)
     }
 
-    /// 读取章节内容（从 mmap）
-    pub fn read_chapter(&self, chapter_index: usize) -> Result<Option<Vec<String>>> {
+    /// 读取章节内容（从 mmap），返回未换行的原始行
+    pub fn read_chapter_raw(&self, chapter_index: usize) -> Result<Option<Vec<String>>> {
         let meta = self.meta.as_ref().ok_or_else(|| anyhow::anyhow!("cache meta not loaded"))?;
         let mmap = self.mmap.as_ref().ok_or_else(|| anyhow::anyhow!("mmap not initialized"))?;
 
@@ -250,36 +258,84 @@ impl CacheManager {
         Ok(Some(lines))
     }
 
-    /// 更新热缓存中心章节（保持 ±3 章在内存）
+    /// 读取章节内容（按指定宽度换行，优先从热缓存获取）
+    pub fn read_chapter(&self, chapter_index: usize, viewport_width: u16) -> Result<Option<Vec<String>>> {
+        // 先尝试热缓存
+        if let Some(cached) = self.get_hot_chapter(chapter_index, viewport_width) {
+            return Ok(Some(cached.lines));
+        }
+
+        // 热缓存未命中，从 mmap 读取并换行
+        let raw_lines = self.read_chapter_raw(chapter_index)?;
+        if let Some(lines) = raw_lines {
+            let wrapped = Self::wrap_lines(&lines, viewport_width as usize);
+            Ok(Some(wrapped))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 逐字符换行（支持中文无空格、混合文本）
+    fn wrap_lines(lines: &[String], width: usize) -> Vec<String> {
+        if width == 0 { return lines.to_vec(); }
+        let mut result = Vec::new();
+        for line in lines {
+            if line.is_empty() {
+                result.push(String::new());
+                continue;
+            }
+            let mut current_line = String::new();
+            let mut current_width = 0;
+            for ch in line.chars() {
+                let ch_width = ch.width().unwrap_or(1);
+                if current_width + ch_width <= width {
+                    current_line.push(ch);
+                    current_width += ch_width;
+                } else {
+                    result.push(current_line);
+                    current_line = ch.to_string();
+                    current_width = ch_width;
+                }
+            }
+            if !current_line.is_empty() { result.push(current_line); }
+        }
+        result
+    }
+
+    /// 更新热缓存中心章节（保持 ±3 章在内存，按指定宽度换行）
     pub fn update_hot_cache(&self, center: usize, viewport_width: u16) {
         let mut hot = self.hot_cache.lock().unwrap();
-        if hot.center_chapter == Some(center) {
+        if hot.center_chapter == Some(center) && hot.viewport_width == viewport_width {
             return;
         }
         hot.center_chapter = Some(center);
+        hot.viewport_width = viewport_width;
 
         // 移除超出范围的章节
         let min_idx = center.saturating_sub(3);
         let max_idx = center + 3;
         hot.chapters.retain(|&idx, _| idx >= min_idx && idx <= max_idx);
 
-        // 预加载缺失的章节（异步或同步）
-        // 这里同步预加载，实际可放后台线程
+        // 同步预加载缺失的章节
         if let Some(meta) = &self.meta {
             for idx in min_idx..=max_idx {
                 if idx < meta.chapters.len() && !hot.chapters.contains_key(&idx) {
-                    if let Ok(Some(lines)) = self.read_chapter(idx) {
+                    if let Ok(Some(raw_lines)) = self.read_chapter_raw(idx) {
+                        let wrapped = Self::wrap_lines(&raw_lines, viewport_width as usize);
                         let title = meta.chapters[idx].title.clone();
-                        hot.chapters.insert(idx, CachedChapter { title, lines });
+                        hot.chapters.insert(idx, CachedChapter { title, lines: wrapped });
                     }
                 }
             }
         }
     }
 
-    /// 从热缓存获取章节（若命中）
-    pub fn get_hot_chapter(&self, index: usize) -> Option<CachedChapter> {
+    /// 从热缓存获取章节（若命中且宽度匹配）
+    pub fn get_hot_chapter(&self, index: usize, viewport_width: u16) -> Option<CachedChapter> {
         let hot = self.hot_cache.lock().unwrap();
+        if hot.viewport_width != viewport_width {
+            return None;
+        }
         hot.chapters.get(&index).cloned()
     }
 
@@ -290,13 +346,15 @@ impl CacheManager {
             meta.last_line_offset = line_offset;
 
             let book_id = meta.book_id.clone();
-            drop(meta); // 释放可变借用
+            let meta_clone = meta.clone();
+            // 释放可变借用
+            let _ = meta;
 
             let (meta_path, _) = self.cache_paths(&book_id);
             let tmp_path = meta_path.with_extension("meta.json.tmp");
 
             let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp_path)?;
-            let json = serde_json::to_string_pretty(&self.meta.as_ref().unwrap())?;
+            let json = serde_json::to_string_pretty(&meta_clone)?;
             file.write_all(json.as_bytes())?;
             file.flush()?;
             file.sync_all()?;
@@ -317,17 +375,50 @@ impl CacheManager {
         Ok(total)
     }
 
-    /// 清理旧缓存（保留最近 N 本）
+    /// 清理旧缓存（保留最近 N 本书籍）
+    /// 按书籍分组（meta.json + content.dat 为一组），按修改时间排序
     pub fn cleanup_old(&self, keep: usize) -> Result<()> {
-        let mut entries: Vec<_> = fs::read_dir(&self.cache_dir)?
+        // 收集所有 meta.json 文件
+        let mut book_entries: Vec<_> = fs::read_dir(&self.cache_dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter(|e| {
+                e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                    && e.path().extension().map(|ext| ext == "json").unwrap_or(false)
+            })
             .collect();
 
-        entries.sort_by_key(|e| e.metadata().map(|m| m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)).unwrap_or(std::time::SystemTime::UNIX_EPOCH));
+        // 按修改时间排序（最新在前）
+        book_entries.sort_by_key(|e| {
+            e.metadata()
+                .map(|m| m.modified().unwrap_or(SystemTime::UNIX_EPOCH))
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        });
+        book_entries.reverse();
 
-        for entry in entries.iter().take(entries.len().saturating_sub(keep)) {
-            fs::remove_file(entry.path()).ok();
+        // 删除超出保留数量的书籍（删除对应的 meta.json 和 content.dat）
+        for entry in book_entries.iter().skip(keep) {
+            let meta_path = entry.path();
+            let book_id = meta_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let content_path = self.cache_dir.join(format!("{}.content.dat", book_id));
+            let tmp_meta = meta_path.with_extension("meta.json.tmp");
+            let tmp_content = content_path.with_extension("content.dat.tmp");
+            
+            fs::remove_file(&meta_path).ok();
+            fs::remove_file(&content_path).ok();
+            fs::remove_file(&tmp_meta).ok();
+            fs::remove_file(&tmp_content).ok();
+        }
+        Ok(())
+    }
+
+    /// 清理临时文件（启动时调用）
+    pub fn cleanup_temp_files(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.cache_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map(|ext| ext == "tmp").unwrap_or(false) {
+                fs::remove_file(&path).ok();
+            }
         }
         Ok(())
     }
@@ -353,18 +444,23 @@ impl CacheBuilder {
         self.book_title = title;
     }
 
-    /// 添加一章内容
+    /// 添加一章内容，计算 line_count（按标准宽度 80）
     pub fn add_chapter(&mut self, index: usize, title: String, content: &str) -> Result<()> {
         let bytes = content.as_bytes();
         self.content_file.write_all(bytes)?;
         self.content_file.flush()?;
+
+        // 计算按 80 字符宽度换行后的行数
+        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let wrapped = CacheManager::wrap_lines(&lines, 80);
+        let line_count = wrapped.len() as u32;
 
         let chapter_meta = ChapterMeta {
             index,
             title,
             start_offset: self.current_offset,
             length: bytes.len() as u32,
-            line_count: 0, // 后续按宽度换行时计算
+            line_count,
         };
         self.chapters.push(chapter_meta);
         self.current_offset += bytes.len() as u64;

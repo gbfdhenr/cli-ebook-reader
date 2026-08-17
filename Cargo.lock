@@ -246,6 +246,7 @@ dependencies = [
  "html2text",
  "memmap2",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "signal-hook",

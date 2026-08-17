@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_install:
+	install -Dm755 target/release/cli-ebook-reader-rust debian/cli-ebook-reader/usr/bin/cli-ebook-reader
+
+override_dh_auto_clean:
+	cargo clean
+	rm -rf debian/cli-ebook-reader
