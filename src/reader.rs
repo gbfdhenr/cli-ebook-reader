@@ -214,7 +214,7 @@ impl ReaderState {
                     let title = Self::find_chapter_title_static(&doc, resource_id)
                         .unwrap_or_else(|| format!("Chapter {}", chapter_infos.len() + 1));
                     // 检查是否为目录章节（通过标题或内容特征判断）
-                    let is_toc = Self::is_toc_chapter(&doc, resource_id, &title);
+                    let is_toc = Self::is_toc_chapter(&mut doc, resource_id, &title);
                     chapter_infos.push((resource_id.to_string(), title, is_toc));
                 }
             }
@@ -315,7 +315,7 @@ impl ReaderState {
     }
 
     /// 判断是否为目录章节（TOC）
-    fn is_toc_chapter(doc: &EpubDoc<impl io::Read + io::Seek>, resource_id: &str, title: &str) -> bool {
+    fn is_toc_chapter(doc: &mut EpubDoc<impl io::Read + io::Seek>, resource_id: &str, title: &str) -> bool {
         // 1. 通过标题判断：包含 "目录"、"Table of Contents"、"Contents" 等关键词
         let title_lower = title.to_lowercase();
         if title_lower.contains("目录") 
