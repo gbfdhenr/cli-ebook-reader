@@ -349,11 +349,12 @@ impl ReaderState {
         use std::thread;
         use std::time::Duration;
 
-        let html = html.to_string();
+        let html_owned = html.to_string();
+        let html_for_fallback = html_owned.clone();
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
-            let result = from_read(html.as_bytes(), width);
+            let result = from_read(html_owned.as_bytes(), width);
             let _ = tx.send(result);
         });
 
@@ -362,7 +363,7 @@ impl ReaderState {
             Ok(text) => text,
             Err(_) => {
                 // 超时：使用简单的正则提取文本内容
-                Self::simple_html_to_text(&html, width)
+                Self::simple_html_to_text(&html_for_fallback, width)
             }
         }
     }
@@ -397,7 +398,7 @@ impl ReaderState {
             .replace(">", ">")
             .replace("&", "&")
             .replace(""", "\"")
-            .replace("'", "'")
+            .replace("&apos;", "'")
             .replace("&mdash;", "—")
             .replace("&ndash;", "–")
             .replace("&hellip;", "…");
