@@ -283,37 +283,65 @@ impl ReaderState {
         None
     }
 
+
     /// 清理 HTML，移除图片、脚本、样式等可能导致 html2text 卡顿的元素
     fn clean_html_for_text_extraction(html: &str) -> String {
         use regex::Regex;
         let mut result = html.to_string();
 
-        // 移除 <img> 标签（保留 alt 文本）
-        let img_re = Regex::new(r#"<img[^>]*alt\s*=\s*["']([^"']*)["'][^>]*>"#).unwrap();
-        result = img_re.replace_all(&result, |caps: &regex::Captures| {
-            let alt = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        // 1. 移除 <img> 标签（处理各种属性顺序、单双引号、自闭合等）
+        // 先处理有 alt 的
+        let img_with_alt = Regex::new(r#"(?i)<img\b[^>]*\balt\s*=\s*(["'])([^"']*)\1[^>]*>"#).unwrap();
+        result = img_with_alt.replace_all(&result, |caps: &regex::Captures| {
+            let alt = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             format!("[图片: {}]", alt)
         }).to_string();
-        
-        // 移除没有 alt 的 <img> 标签
-        let img_no_alt_re = Regex::new(r#"<img[^>]*>"#).unwrap();
-        result = img_no_alt_re.replace_all(&result, "[图片]").to_string();
 
-        // 移除 <script> 标签及其内容
-        let script_re = Regex::new(r"(?s)<script[^>]*>.*?</script>").unwrap();
+        // 再处理没有 alt 的（包括各种属性组合）
+        let img_no_alt = Regex::new(r#"(?i)<img\b[^>]*>"#).unwrap();
+        result = img_no_alt.replace_all(&result, "[图片]").to_string();
+
+        // 2. 移除 <script> 标签及其内容（包括跨行）
+        let script_re = Regex::new(r"(?si)<script\b[^>]*>.*?</script>").unwrap();
         result = script_re.replace_all(&result, "").to_string();
 
-        // 移除 <style> 标签及其内容
-        let style_re = Regex::new(r"(?s)<style[^>]*>.*?</style>").unwrap();
+        // 3. 移除 <style> 标签及其内容
+        let style_re = Regex::new(r"(?si)<style\b[^>]*>.*?</style>").unwrap();
         result = style_re.replace_all(&result, "").to_string();
 
-        // 移除 HTML 注释
+        // 4. 移除 <noscript> 标签及其内容
+        let noscript_re = Regex::new(r"(?si)<noscript\b[^>]*>.*?</noscript>").unwrap();
+        result = noscript_re.replace_all(&result, "").to_string();
+
+        // 5. 移除 HTML 注释
         let comment_re = Regex::new(r"(?s)<!--.*?-->").unwrap();
         result = comment_re.replace_all(&result, "").to_string();
 
-        result
-    }
+        // 6. 移除 SVG 标签及其内容（常包含大量路径数据）
+        let svg_re = Regex::new(r"(?si)<svg\b[^>]*>.*?</svg>").unwrap();
+        result = svg_re.replace_all(&result, "[SVG图片]").to_string();
 
+        // 7. 移除 canvas 标签
+        let canvas_re = Regex::new(r"(?si)<canvas\b[^>]*>.*?</canvas>").unwrap();
+        result = canvas_re.replace_all(&result, "[Canvas]").to_string();
+
+        // 8. 简化剩余标签：保留常用排版标签，其余替换为空格
+        // 保留: p, br, h1-h6, strong, b, em, i, u, span, div, blockquote, ul, ol, li, a
+        let allowed_tags = ["p", "br", "h1", "h2", "h3", "h4", "h5", "h6",
+                            "strong", "b", "em", "i", "u", "span", "div",
+                            "blockquote", "ul", "ol", "li", "a"];
+        let allowed_pattern = allowed_tags.join("|");
+
+        // 移除不在允许列表中的标签（保留内容）
+        let tag_re = Regex::new(&format!(r"(?i)</?(?!/?(?:{})\b)[a-z][a-z0-9]*\b[^>]*>", allowed_pattern)).unwrap();
+        result = tag_re.replace_all(&result, " ").to_string();
+
+        // 9. 清理多余空白
+        let whitespace_re = Regex::new(r"\s+").unwrap();
+        result = whitespace_re.replace_all(&result, " ").to_string();
+
+        result.trim().to_string()
+    }
     /// 判断是否为目录章节（TOC）
     fn is_toc_chapter(doc: &mut EpubDoc<impl io::Read + io::Seek>, resource_id: &str, title: &str) -> bool {
         // 1. 通过标题判断：包含 "目录"、"Table of Contents"、"Contents" 等关键词
