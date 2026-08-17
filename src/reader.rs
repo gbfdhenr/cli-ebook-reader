@@ -239,7 +239,7 @@ impl ReaderState {
             if let Some((content, _)) = doc.get_resource_str(&resource_id) {
                 // 预处理 HTML：移除图片标签和其他可能导致 html2text 卡顿的元素
                 let cleaned_html = Self::clean_html_for_text_extraction(&content);
-                let mut plain_text = from_read(cleaned_html.as_bytes(), 80);
+                let mut plain_text = Self::html_to_text_with_timeout(&cleaned_html, 80);
                 
                 // 如果是目录章节，尝试解析其中的 markdown 链接
                 if *is_toc {
@@ -342,6 +342,74 @@ impl ReaderState {
 
         result.trim().to_string()
     }
+
+    /// 带超时的 HTML 转文本，超时后回退到简单正则提取
+    fn html_to_text_with_timeout(html: &str, width: usize) -> String {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let html = html.to_string();
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = from_read(html.as_bytes(), width);
+            let _ = tx.send(result);
+        });
+
+        // 等待 5 秒，超时则回退
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(text) => text,
+            Err(_) => {
+                // 超时：使用简单的正则提取文本内容
+                Self::simple_html_to_text(&html, width)
+            }
+        }
+    }
+
+    /// 简单的 HTML 转文本（不依赖 html2text，用作超时回退）
+    fn simple_html_to_text(html: &str, width: usize) -> String {
+        use regex::Regex;
+        let mut result = html.to_string();
+
+        // 替换块级标签为换行
+        let block_tags = ["p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6", 
+                          "blockquote", "ul", "ol", "li", "tr", "td", "th", "table"];
+        for tag in block_tags {
+            let re = Regex::new(&format!(r"(?i)</?{}\b[^>]*>", tag)).unwrap();
+            result = re.replace_all(&result, "\n").to_string();
+        }
+
+        // 替换内联标签为空格
+        let inline_tags = ["span", "strong", "b", "em", "i", "u", "a", "font", "small", "big"];
+        for tag in inline_tags {
+            let re = Regex::new(&format!(r"(?i)</?{}\b[^>]*>", tag)).unwrap();
+            result = re.replace_all(&result, " ").to_string();
+        }
+
+        // 移除剩余所有标签
+        let tag_re = Regex::new(r"(?i)<[^>]*>").unwrap();
+        result = tag_re.replace_all(&result, " ").to_string();
+
+        // 处理 HTML 实体
+        result = result.replace("&nbsp;", " ")
+            .replace("<", "<")
+            .replace(">", ">")
+            .replace("&", "&")
+            .replace(""", "\"")
+            .replace("'", "'")
+            .replace("&mdash;", "—")
+            .replace("&ndash;", "–")
+            .replace("&hellip;", "…");
+
+        // 清理多余空白
+        let ws_re = Regex::new(r"\s+").unwrap();
+        result = ws_re.replace_all(&result, " ").to_string();
+
+        // 按宽度换行
+        Self::wrap_text(&result, width).join("\n")
+    }
+
     /// 判断是否为目录章节（TOC）
     fn is_toc_chapter(doc: &mut EpubDoc<impl io::Read + io::Seek>, resource_id: &str, title: &str) -> bool {
         // 1. 通过标题判断：包含 "目录"、"Table of Contents"、"Contents" 等关键词
