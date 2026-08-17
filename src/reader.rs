@@ -8,7 +8,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::style::{Style, Color, Modifier};
 use ratatui::text::{Line, Span, Text};
-use std::fs::OpenOptions;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -19,18 +18,6 @@ use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
 
 use crate::cache::{CacheManager, global_cache};
 use crate::common::events::check_resize;
-
-/// 记录日志到文件
-fn log_to_file(msg: &str) {
-    eprintln!("[LOG] {}", msg);  // Debug: also print to stderr
-    let log_dir = dirs::home_dir().unwrap_or_default().join(".cli-ebook-reader/logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-    let log_file = log_dir.join(format!("log-{}.txt", chrono::Local::now().format("%Y%m%d-%H%M%S")));
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_file) {
-        use std::io::Write;
-        let _ = writeln!(file, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Chapter {
@@ -144,7 +131,6 @@ impl ReaderState {
 
     /// 启动异步加载
     fn start_loading(&mut self) {
-        log_to_file("start_loading: starting");
         let epub_path = self.epub_path.clone();
         let cache = self.cache.clone();
         let first_load = self.first_load;
@@ -162,7 +148,6 @@ impl ReaderState {
         });
 
         let handle = thread::spawn(move || {
-            log_to_file("start_loading: background thread started");
             // 发送进度更新的辅助函数
             let send_progress = |tx: &mpsc::Sender<LoadingProgress>, progress: f32, current: usize, total: usize, stage: LoadingStage| {
                 let _ = tx.send(LoadingProgress { progress, current_chapter: current, total_chapters: total, stage });
@@ -176,7 +161,6 @@ impl ReaderState {
             // 尝试从缓存加载
             let mut cache_guard = cache.lock().unwrap();
             if let Ok(Some(meta)) = cache_guard.load_meta(&epub_path) {
-                log_to_file(&format!("start_loading: cache hit, {} chapters", meta.chapters.len()));
                 // 有有效缓存，从 mmap 读取所有章节（按当前视口宽度换行）
                 let total = meta.chapters.len();
                 let mut chapters = Vec::new();
@@ -190,12 +174,10 @@ impl ReaderState {
                 }
                 cache_guard.update_hot_cache(0, 80);
                 send_progress(&progress_tx, 1.0, total, total, LoadingStage::Done);
-                log_to_file("start_loading: cache load complete");
                 return Ok(chapters);
             }
             drop(cache_guard);
 
-            log_to_file("start_loading: cache miss, parsing EPUB");
             // 无缓存，解析 EPUB 并构建缓存
             Self::parse_and_cache(epub_path, cache, first_load, progress_tx)
         });
@@ -216,11 +198,9 @@ impl ReaderState {
 
         // 立即发送初始进度，避免大文件打开时长时间无反馈
         send_progress(&progress_tx, 0.01, 0, 0, LoadingStage::ParsingSpine);
-        log_to_file("parse_and_cache: starting");
 
         let mut doc = EpubDoc::new(&epub_path).context("open epub")?;
         let book_title = doc.get_title().unwrap_or_else(|| "Unknown Book".to_string());
-        log_to_file(&format!("parse_and_cache: opened epub, title: {}", book_title));
 
         // EPUB 文档已打开，发送进度
         send_progress(&progress_tx, 0.05, 0, 0, LoadingStage::ParsingSpine);
@@ -252,7 +232,6 @@ impl ReaderState {
         }
 
         let total_chapters = chapter_infos.len();
-        log_to_file(&format!("parse_and_cache: collected {} chapters, starting extraction", total_chapters));
         send_progress(&progress_tx, 0.15, 0, total_chapters, LoadingStage::ExtractingChapters);
 
         // 开始构建缓存
@@ -266,7 +245,6 @@ impl ReaderState {
         let mut chapters = Vec::new();
         for (idx, (resource_id, title, is_toc, content)) in chapter_infos.iter().enumerate() {
             if idx % 200 == 0 {
-                log_to_file(&format!("parse_and_cache: processing chapter {}/{}", idx + 1, total_chapters));
             }
             let progress = 0.15 + 0.7 * (idx as f32 / total_chapters.max(1) as f32);
             send_progress(&progress_tx, progress, idx + 1, total_chapters, LoadingStage::ExtractingChapters);
@@ -285,7 +263,6 @@ impl ReaderState {
                 });
             }
         }
-        log_to_file("parse_and_cache: extraction complete, building cache");
         {
             let mut cache_guard = cache.lock().unwrap();
             cache_guard.finish_build(builder)?;
@@ -299,7 +276,6 @@ impl ReaderState {
         }
 
         send_progress(&progress_tx, 1.0, total_chapters, total_chapters, LoadingStage::Done);
-        log_to_file("parse_and_cache: done");
         Ok(chapters)
     }
 
@@ -526,11 +502,9 @@ impl ReaderState {
         // 再检查线程是否完成
         if let Some(handle) = self.load_handle.take() {
             if handle.is_finished() {
-                log_to_file("check_loading: background thread finished");
                 match handle.join() {
                     Ok(Ok(chapters)) => {
                         if !chapters.is_empty() {
-                            log_to_file(&format!("check_loading: loaded {} chapters", chapters.len()));
                             // 从缓存获取真实书名和阅读进度
                             if let Ok(guard) = self.cache.lock() {
                                 if let Some(meta) = guard.get_meta() {
@@ -547,7 +521,6 @@ impl ReaderState {
                         self.chapters = chapters;
                         self.loading_state = LoadingState::Loaded;
                         self.first_load = false;
-                        log_to_file(&format!("check_loading: loading complete, {} chapters loaded", self.chapters.len()));
                         // 加载完成后钳制偏移
                         self.clamp_offset();
                     }
@@ -609,22 +582,14 @@ impl ReaderState {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        log_to_file("run: starting");
-        eprintln!("DEBUG: run: creating terminal");
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        eprintln!("DEBUG: run: terminal created");
         terminal.clear()?;
-        eprintln!("DEBUG: run: terminal cleared");
         crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
-        eprintln!("DEBUG: run: mouse capture enabled");
 
         // 启动加载
-        log_to_file("run: calling start_loading");
         self.start_loading();
-        log_to_file("run: start_loading returned");
 
         let result = (|| {
-            eprintln!("DEBUG: run: entering main loop");
             loop {
                 // 检查 Ctrl+C 超时（3秒）
                 if self.exit_confirm == ExitConfirmState::CtrlCPressed {
@@ -641,9 +606,7 @@ impl ReaderState {
 
                 if check_resize() { terminal.autoresize()?; }
 
-                eprintln!("DEBUG: run: before draw");
                 terminal.draw(|frame| {
-                    eprintln!("DEBUG: run: in draw closure");
                     let area = frame.area();
                     self.terminal_height = area.height;
                     self.terminal_width = area.width;

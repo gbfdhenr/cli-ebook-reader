@@ -10,7 +10,6 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// Initialize terminal: raw mode + alternate screen + hidden cursor
 /// Returns error if already initialized or initialization fails
 pub fn init() -> io::Result<()> {
-    eprintln!("DEBUG: terminal::init start");
     // Atomic check-and-set to prevent double initialization
     if INITIALIZED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return Err(io::Error::new(
@@ -18,7 +17,6 @@ pub fn init() -> io::Result<()> {
             "Terminal already initialized",
         ));
     }
-    eprintln!("DEBUG: atomic check passed");
 
     // Setup panic hook to restore terminal on panic
     let original_hook = panic::take_hook();
@@ -27,12 +25,9 @@ pub fn init() -> io::Result<()> {
         let _ = restore_terminal();
         original_hook(panic_info);
     }));
-    eprintln!("DEBUG: panic hook set");
 
     terminal::enable_raw_mode()?;
-    eprintln!("DEBUG: raw mode enabled");
     execute!(stdout(), EnterAlternateScreen, Hide)?;
-    eprintln!("DEBUG: execute completed");
     Ok(())
 }
 
