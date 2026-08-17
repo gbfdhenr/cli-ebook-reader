@@ -237,9 +237,8 @@ impl ReaderState {
             send_progress(&progress_tx, progress, idx + 1, total_chapters, LoadingStage::ExtractingChapters);
 
             if let Some((content, _)) = doc.get_resource_str(&resource_id) {
-                // 预处理 HTML：移除图片标签和其他可能导致 html2text 卡顿的元素
-                let cleaned_html = Self::clean_html_for_text_extraction(&content);
-                let mut plain_text = Self::html_to_text_with_timeout(&cleaned_html, 80);
+                // 智能选择转换策略：图片密集型直接用正则，其他先清理再尝试 html2text
+                let mut plain_text = Self::html_to_text(&content, 80);
                 
                 // 如果是目录章节，尝试解析其中的 markdown 链接
                 if *is_toc {
@@ -343,6 +342,22 @@ impl ReaderState {
         result.trim().to_string()
     }
 
+    /// HTML 转文本：先清理，再用简单正则提取（避免 html2text 卡死）
+    /// 对于包含大量图片/复杂标签的 HTML，直接使用简单正则提取
+    fn html_to_text(html: &str, width: usize) -> String {
+        // 检测是否为图片密集型内容（包含大量 <img> 或 base64 图片）
+        let img_count = html.matches("<img").count() + html.matches("data:image").count();
+        let html_len = html.len();
+        
+        // 如果图片密集或 HTML 很大，直接用简单正则提取
+        if img_count > 10 || html_len > 500_000 {
+            return Self::simple_html_to_text(html, width);
+        }
+        
+        // 否则尝试 html2text，但限制处理时间
+        Self::html_to_text_with_timeout(html, width)
+    }
+
     /// 带超时的 HTML 转文本，超时后回退到简单正则提取
     fn html_to_text_with_timeout(html: &str, width: usize) -> String {
         use std::sync::mpsc;
@@ -358,8 +373,8 @@ impl ReaderState {
             let _ = tx.send(result);
         });
 
-        // 等待 5 秒，超时则回退
-        match rx.recv_timeout(Duration::from_secs(5)) {
+        // 等待 3 秒，超时则回退（缩短超时时间）
+        match rx.recv_timeout(Duration::from_secs(3)) {
             Ok(text) => text,
             Err(_) => {
                 // 超时：使用简单的正则提取文本内容
