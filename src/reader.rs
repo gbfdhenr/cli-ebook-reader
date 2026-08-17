@@ -222,8 +222,8 @@ impl ReaderState {
                     .unwrap_or_else(|| format!("Chapter {}", chapter_infos.len() + 1));
                 // 读取内容一次，供 TOC 检测和后续提取复用
                 let (content, _) = doc.get_resource_str(resource_id).unwrap_or((String::new(), String::new()));
-                // 检测是否为 TOC 章节（需要可变 doc）
-                let is_toc = Self::is_toc_chapter(&mut doc, resource_id, &title);
+                // 检测是否为 TOC 章节（使用已读内容，避免二次读取）
+                let is_toc = Self::is_toc_chapter(&content, &title);
                 chapter_infos.push((resource_id.to_string(), title, is_toc, content));
             } else {
                 // 非 HTML 资源（图片、CSS 等）不加入章节列表
@@ -243,19 +243,17 @@ impl ReaderState {
 
         // 阶段 2：提取章节内容并写入缓存
         let mut chapters = Vec::new();
-        for (idx, (resource_id, title, is_toc, _content)) in chapter_infos.iter().enumerate() {
+        for (idx, (resource_id, title, is_toc, content)) in chapter_infos.iter().enumerate() {
             let progress = 0.15 + 0.7 * (idx as f32 / total_chapters.max(1) as f32);
             send_progress(&progress_tx, progress, idx + 1, total_chapters, LoadingStage::ExtractingChapters);
 
-            if let Some((content, _)) = doc.get_resource_str(&resource_id) {
-                // 智能选择转换策略：图片密集型直接用正则，其他先清理再尝试 html2text
-                let mut plain_text = Self::html_to_text(&content, 80);
-                
-                // 如果是目录章节，尝试解析其中的 markdown 链接
+            if !content.is_empty() {
+                let mut plain_text = Self::html_to_text(content, 80);
+
                 if *is_toc {
                     plain_text = Self::process_toc_chapter(&plain_text, &doc, &chapter_infos);
                 }
-                
+
                 builder.add_chapter(idx, title.clone(), &plain_text)?;
                 chapters.push(Chapter {
                     title: title.clone(),
@@ -263,9 +261,6 @@ impl ReaderState {
                 });
             }
         }
-
-        // 阶段 3：完成缓存构建
-        send_progress(&progress_tx, 0.9, total_chapters, total_chapters, LoadingStage::BuildingCache);
         {
             let mut cache_guard = cache.lock().unwrap();
             cache_guard.finish_build(builder)?;
@@ -436,24 +431,17 @@ impl ReaderState {
         // 按宽度换行
         Self::wrap_text(&result, width).join("\n")
     }
-
     /// 判断是否为目录章节（TOC）
-    fn is_toc_chapter(doc: &mut EpubDoc<impl io::Read + io::Seek>, resource_id: &str, title: &str) -> bool {
+    fn is_toc_chapter(content: &str, title: &str) -> bool {
         // 1. 通过标题判断：包含 "目录"、"Table of Contents"、"Contents" 等关键词
         let title_lower = title.to_lowercase();
-        if title_lower.contains("目录") 
-            || title_lower.contains("table of contents") 
+        if title_lower.contains("目录")
+            || title_lower.contains("table of contents")
             || title_lower.contains("contents")
             || title_lower.contains("toc") {
-            return true;
-        }
-
-        // 2. 通过内容判断：如果章节主要包含指向其他章节的链接
-        if let Some((content, _)) = doc.get_resource_str(resource_id) {
-            // 简单检查：内容中是否包含大量指向 spine 内部的链接
+            // 标题匹配时，再检查内容链接密度确认
             let link_count = content.matches("<a href=").count();
             let text_len = content.len();
-            // 如果链接密度很高，可能是目录
             if link_count > 5 && text_len < 5000 {
                 return true;
             }
