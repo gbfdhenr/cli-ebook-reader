@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "cli-ebook-reader-rust"
-version = "1.0.8"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
