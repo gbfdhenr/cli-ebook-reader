@@ -214,15 +214,16 @@ impl ReaderState {
             send_progress(&progress_tx, spine_progress, spine_idx + 1, total_spine, LoadingStage::ParsingSpine);
 
             let resource_id = &spine_item.idref;
-            // 直接使用 spine 条目的 mime 类型，避免读取内容（防止大图片解压卡顿）
-            let mime = &spine_item.mime;
+            // 通过 resource_id 获取 mime 类型
+            let mime = doc.get_resource_mime(resource_id).unwrap_or_default();
 
             if mime == "application/xhtml+xml" || mime == "text/html" {
                 let title = Self::find_chapter_title_static(&doc, resource_id)
                     .unwrap_or_else(|| format!("Chapter {}", chapter_infos.len() + 1));
                 // 读取内容一次，供 TOC 检测和后续提取复用
                 let (content, _) = doc.get_resource_str(resource_id).unwrap_or((String::new(), String::new()));
-                let is_toc = Self::is_toc_chapter_from_content(&content, &title);
+                // 检测是否为 TOC 章节（需要可变 doc）
+                let is_toc = Self::is_toc_chapter(&mut doc, resource_id, &title);
                 chapter_infos.push((resource_id.to_string(), title, is_toc, content));
             } else {
                 // 非 HTML 资源（图片、CSS 等）不加入章节列表
@@ -242,7 +243,7 @@ impl ReaderState {
 
         // 阶段 2：提取章节内容并写入缓存
         let mut chapters = Vec::new();
-        for (idx, (resource_id, title, is_toc)) in chapter_infos.iter().enumerate() {
+        for (idx, (resource_id, title, is_toc, _content)) in chapter_infos.iter().enumerate() {
             let progress = 0.15 + 0.7 * (idx as f32 / total_chapters.max(1) as f32);
             send_progress(&progress_tx, progress, idx + 1, total_chapters, LoadingStage::ExtractingChapters);
 
@@ -461,7 +462,7 @@ impl ReaderState {
     }
 
     /// 处理目录章节：解析 markdown 格式的链接，转换为可读格式
-    fn process_toc_chapter(text: &str, _doc: &EpubDoc<impl io::Read + io::Seek>, chapter_infos: &[(String, String, bool)]) -> String {
+    fn process_toc_chapter(text: &str, _doc: &EpubDoc<impl io::Read + io::Seek>, chapter_infos: &[(String, String, bool, String)]) -> String {
         use regex::Regex;
         let mut result = text.to_string();
         
@@ -472,7 +473,7 @@ impl ReaderState {
             let link_url = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             
             // 尝试匹配到对应的章节
-            for (_, chapter_title, _) in chapter_infos {
+            for (_, chapter_title, _, _) in chapter_infos {
                 if chapter_title.contains(link_text) || link_text.contains(chapter_title) {
                     return format!("► {} (第 {} 章)", link_text, chapter_title);
                 }
@@ -488,7 +489,7 @@ impl ReaderState {
             let link_url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let link_text = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             
-            for (_, chapter_title, _) in chapter_infos {
+            for (_, chapter_title, _, _) in chapter_infos {
                 if chapter_title.contains(link_text) || link_text.contains(chapter_title) {
                     return format!("► {} (第 {} 章)", link_text, chapter_title);
                 }
