@@ -205,18 +205,28 @@ impl ReaderState {
         // EPUB 文档已打开，发送进度
         send_progress(&progress_tx, 0.05, 0, 0, LoadingStage::ParsingSpine);
         let spine_items: Vec<_> = doc.spine.iter().cloned().collect();
+        let total_spine = spine_items.len().max(1);
         let mut chapter_infos = Vec::new();
 
-        for spine_item in &spine_items {
+        for (spine_idx, spine_item) in spine_items.iter().enumerate() {
+            // 细粒度进度：解析 spine 条目阶段 5% -> 15%
+            let spine_progress = 0.05 + 0.1 * (spine_idx as f32 / total_spine as f32);
+            send_progress(&progress_tx, spine_progress, spine_idx + 1, total_spine, LoadingStage::ParsingSpine);
+
             let resource_id = &spine_item.idref;
-            if let Some((_, mime)) = doc.get_resource_str(resource_id) {
-                if mime == "application/xhtml+xml" || mime == "text/html" {
-                    let title = Self::find_chapter_title_static(&doc, resource_id)
-                        .unwrap_or_else(|| format!("Chapter {}", chapter_infos.len() + 1));
-                    // 检查是否为目录章节（通过标题或内容特征判断）
-                    let is_toc = Self::is_toc_chapter(&mut doc, resource_id, &title);
-                    chapter_infos.push((resource_id.to_string(), title, is_toc));
-                }
+            // 直接使用 spine 条目的 mime 类型，避免读取内容（防止大图片解压卡顿）
+            let mime = &spine_item.mime;
+
+            if mime == "application/xhtml+xml" || mime == "text/html" {
+                let title = Self::find_chapter_title_static(&doc, resource_id)
+                    .unwrap_or_else(|| format!("Chapter {}", chapter_infos.len() + 1));
+                // 读取内容一次，供 TOC 检测和后续提取复用
+                let (content, _) = doc.get_resource_str(resource_id).unwrap_or((String::new(), String::new()));
+                let is_toc = Self::is_toc_chapter_from_content(&content, &title);
+                chapter_infos.push((resource_id.to_string(), title, is_toc, content));
+            } else {
+                // 非 HTML 资源（图片、CSS 等）不加入章节列表
+                chapter_infos.push((resource_id.to_string(), String::new(), false, String::new()));
             }
         }
 

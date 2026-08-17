@@ -8,17 +8,23 @@ mod reader;
 mod terminal;
 
 fn main() -> Result<()> {
+    // Handle --version flag before initializing terminal
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Initialize terminal once for the entire program
     terminal::init()?;
-    
+
     // Setup resize handler
     common::events::init_resize_handler();
 
     // Ensure terminal is restored on any exit path
     let result = run_app();
-    
+
     terminal::restore();
-    
+
     // Print any error after terminal is restored
     if let Err(e) = result {
         eprintln!("Error: {}", e);
