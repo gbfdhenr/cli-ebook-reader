@@ -3,7 +3,7 @@ use memmap2::{MmapMut, MmapOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -420,6 +420,56 @@ impl CacheManager {
                 fs::remove_file(&path).ok();
             }
         }
+        Ok(())
+    }
+
+/// 追加章节到现有缓存（用于增量加载）
+    pub fn append_chapter(&mut self, index: usize, title: &str, content: &str) -> Result<()> {
+        // 先获取必要的信息，避免借用冲突
+        let book_id = self.meta.as_ref().ok_or_else(|| anyhow::anyhow!("cache meta not loaded"))?.book_id.clone();
+        let (meta_path, _) = self.cache_paths(&book_id);
+        let tmp_path = meta_path.with_extension("meta.json.tmp");
+        
+        // 写入内容到文件末尾
+        let mmap_file = self.mmap_file.as_mut().ok_or_else(|| anyhow::anyhow!("mmap file not open"))?;
+        mmap_file.seek(std::io::SeekFrom::End(0))?;
+        let start_offset = mmap_file.metadata()?.len();
+        mmap_file.write_all(content.as_bytes())?;
+        mmap_file.flush()?;
+        mmap_file.sync_all()?;
+
+        let bytes = content.as_bytes();
+        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let wrapped = Self::wrap_lines(&lines, 80);
+        let line_count = wrapped.len() as u32;
+
+        let chapter_meta = ChapterMeta {
+            index,
+            title: title.to_string(),
+            start_offset,
+            length: bytes.len() as u32,
+            line_count,
+        };
+        
+        // 更新 meta（需要可变借用）
+        let meta = self.meta.as_mut().ok_or_else(|| anyhow::anyhow!("cache meta not loaded"))?;
+        meta.chapters.push(chapter_meta);
+
+        // 更新元数据文件
+        let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp_path)?;
+        let json = serde_json::to_string_pretty(meta)?;
+        file.write_all(json.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&tmp_path, &meta_path)?;
+
+        // 重新映射 mmap（文件大小已变化）
+        drop(meta); // 释放可变借用
+        let mmap_file = self.mmap_file.as_ref().ok_or_else(|| anyhow::anyhow!("mmap file not open"))?;
+        self.mmap = None;
+        let mmap = unsafe { MmapOptions::new().map_mut(mmap_file)? };
+        self.mmap = Some(mmap);
+
         Ok(())
     }
 }

@@ -66,6 +66,7 @@ enum LoadingStage {
     ParsingSpine,
     ExtractingChapters,
     BuildingCache,
+    PartialDone,
     Done,
 }
 
@@ -100,6 +101,12 @@ pub struct ReaderState {
     progress_rx: Option<mpsc::Receiver<LoadingProgress>>,
     /// 是否首次加载（用于显示文件名还是书名）
     first_load: bool,
+    /// 剩余待加载的章节信息（用于后台增量加载）
+    pending_chapters: Vec<(String, String, bool, String)>,
+    /// 总章节数（包括未加载的）
+    total_chapters_count: usize,
+    /// 后台增量加载线程句柄
+    incremental_load_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ReaderState {
@@ -126,6 +133,9 @@ impl ReaderState {
             load_handle: None,
             progress_rx: None,
             first_load,
+            pending_chapters: Vec::new(),
+            total_chapters_count: 0,
+            incremental_load_handle: None,
         })
     }
 
@@ -232,7 +242,11 @@ impl ReaderState {
         }
 
         let total_chapters = chapter_infos.len();
-        send_progress(&progress_tx, 0.15, 0, total_chapters, LoadingStage::ExtractingChapters);
+        // 初始只加载前 200 章
+        const INITIAL_LOAD_LIMIT: usize = 200;
+        let initial_load = total_chapters.min(INITIAL_LOAD_LIMIT);
+        
+        send_progress(&progress_tx, 0.15, 0, initial_load, LoadingStage::ExtractingChapters);
 
         // 开始构建缓存
         let mut builder = {
@@ -241,13 +255,11 @@ impl ReaderState {
         };
         builder.set_book_title(book_title.clone());
 
-        // 阶段 2：提取章节内容并写入缓存
+        // 阶段 2：提取前 200 章内容并写入缓存
         let mut chapters = Vec::new();
-        for (idx, (resource_id, title, is_toc, content)) in chapter_infos.iter().enumerate() {
-            if idx % 200 == 0 {
-            }
-            let progress = 0.15 + 0.7 * (idx as f32 / total_chapters.max(1) as f32);
-            send_progress(&progress_tx, progress, idx + 1, total_chapters, LoadingStage::ExtractingChapters);
+        for (idx, (resource_id, title, is_toc, content)) in chapter_infos.iter().enumerate().take(initial_load) {
+            let progress = 0.15 + 0.7 * (idx as f32 / initial_load.max(1) as f32);
+            send_progress(&progress_tx, progress, idx + 1, initial_load, LoadingStage::ExtractingChapters);
 
             if !content.is_empty() {
                 let mut plain_text = Self::html_to_text(content, 80);
@@ -269,13 +281,19 @@ impl ReaderState {
         }
 
         // 初始化热缓存
-        send_progress(&progress_tx, 0.95, total_chapters, total_chapters, LoadingStage::BuildingCache);
+        send_progress(&progress_tx, 0.95, initial_load, initial_load, LoadingStage::BuildingCache);
         {
             let cache_guard = cache.lock().unwrap();
             cache_guard.update_hot_cache(0, 80);
         }
 
-        send_progress(&progress_tx, 1.0, total_chapters, total_chapters, LoadingStage::Done);
+        // 如果还有剩余章节，标记为需要后台加载
+        if total_chapters > INITIAL_LOAD_LIMIT {
+            send_progress(&progress_tx, 1.0, initial_load, total_chapters, LoadingStage::PartialDone);
+        } else {
+            send_progress(&progress_tx, 1.0, total_chapters, total_chapters, LoadingStage::Done);
+        }
+        
         Ok(chapters)
     }
 
@@ -933,6 +951,7 @@ impl ReaderState {
             LoadingStage::ParsingSpine => "解析目录结构",
             LoadingStage::ExtractingChapters => "提取章节内容",
             LoadingStage::BuildingCache => "构建缓存索引",
+            LoadingStage::PartialDone => "部分完成",
             LoadingStage::Done => "完成",
         };
 
