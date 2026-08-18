@@ -938,14 +938,16 @@ impl ReaderState {
 
         let percent = (progress * 100.0) as u32;
         
-        // popup 宽度固定为 80，确保能容纳完整进度信息
-        let popup_width = 80u16.min(area.width);
-        let inner_width = popup_width.saturating_sub(4) as usize; // 减去边框和内边距
-        
-        // 进度条宽度基于 popup 内部宽度
-        let bar_width = inner_width.saturating_sub(30).min(40).max(10);
+        let name_width = display_name.width();
+        let stage_width = stage_text.width();
+        // 固定部分：" 正在加载: " (6) + "  [" (3) + "] " (2) + "  100%  " (8) + "  (1/100)  " (12) + "  阶段 " (4)
+        let fixed_width = 6 + 3 + 2 + 8 + 12 + 4 + name_width + stage_width;
+        // 进度条宽度：最小 10，最大 60，不超过终端宽度减去固定部分
+        let bar_width = ((area.width as usize).saturating_sub(fixed_width + 4)).min(60).max(10);
         let filled = ((bar_width as f32 * progress) as usize).min(bar_width);
         let empty = bar_width - filled;
+        // popup 总宽度
+        let popup_width = (fixed_width + bar_width + 4).min(area.width as usize).max(40) as u16;
 
         // total_chapters 是 &usize（从引用解构），需要解引用
         let total_ch = *total_chapters;
@@ -966,7 +968,6 @@ impl ReaderState {
             .alignment(ratatui::layout::Alignment::Center)
             .block(Block::default().borders(Borders::ALL).title(" 加载中 "));
 
-        // 居中显示，高度改为 3 行更紧凑
         let popup_height = 3;
         let x = (area.width.saturating_sub(popup_width)) / 2;
         let y = (area.height.saturating_sub(popup_height)) / 2;
